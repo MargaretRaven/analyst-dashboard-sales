@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CRM · Сделки — дашборд</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script>
+    // Apply the saved (or system) theme before first paint to avoid a flash.
+    (function () {
+      try {
+        var saved = localStorage.getItem("crm-dash-theme");
+        var theme = saved
+          ? saved
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark");
+        document.documentElement.setAttribute("data-theme", theme);
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+  </script>
+</head>
+<body>
+  <div class="app">
+    <header class="masthead">
+      <div class="masthead__top">
+        <div class="brand">
+          <span class="brand__mark" aria-hidden="true"></span>
+          <div>
+            <h1 class="brand__title">CRM&nbsp;·&nbsp;Сделки</h1>
+            <p class="brand__sub">аналитический дашборд воронки продаж</p>
+          </div>
+        </div>
+        <div class="topbar">
+          <div class="scope">
+            <button class="seg" data-scope="all" aria-pressed="true">Все сделки</button>
+            <button class="seg" data-scope="mine" aria-pressed="false">Мои сделки</button>
+          </div>
+          <button id="themeToggle" class="theme-toggle" type="button" aria-pressed="false" title="Переключить тему">
+            <span class="theme-toggle__icon" aria-hidden="true"></span>
+            <span class="theme-toggle__label">Тема</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="masthead__controls">
+        <div class="filters">
+        <label class="period">
+          <span class="period__label">Период создания</span>
+          <select id="period" class="period__select">
+            <option value="all">За всё время</option>
+            <option value="30">Последние 30 дней</option>
+            <option value="90">Последние 90 дней</option>
+            <option value="180">Последние 180 дней</option>
+            <option value="year">Текущий год</option>
+          </select>
+        </label>
+        <label class="period">
+          <span class="period__label">Воронка</span>
+          <select id="category" class="period__select">
+            <option value="">Все воронки</option>
+          </select>
+        </label>
+        <label class="period">
+          <span class="period__label">Стадия</span>
+          <select id="stage" class="period__select">
+            <option value="">Все стадии</option>
+          </select>
+        </label>
+        </div>
+        <div class="statusline">
+          <span id="updatedAt" class="updated">—</span>
+          <span id="warning" class="warn" hidden></span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section id="kpi" class="kpi" aria-label="Ключевые показатели"></section>
+
+      <section class="grid split">
+        <article class="panel funnel">
+          <header class="panel__head">
+            <h2 class="panel__title">Воронка по стадиям</h2>
+            <span class="panel__hint">количество сделок и сумма</span>
+          </header>
+          <div id="funnel" class="funnel__body"></div>
+        </article>
+
+        <article class="panel recent">
+          <header class="panel__head">
+            <h2 class="panel__title">Последние сделки</h2>
+            <span class="panel__hint" id="recentHint">—</span>
+          </header>
+          <div class="recent__table-wrap">
+            <table class="recent__table">
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="title">Сделка<span class="sortable__ind"></span></th>
+                  <th class="num sortable" data-sort="amount">Сумма<span class="sortable__ind"></span></th>
+                  <th class="sortable" data-sort="stage">Стадия<span class="sortable__ind"></span></th>
+                  <th class="sortable" data-sort="assignee">Ответственный<span class="sortable__ind"></span></th>
+                  <th class="num sortable" data-sort="createdAt">Создана<span class="sortable__ind"></span></th>
+                </tr>
+              </thead>
+              <tbody id="recentBody"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <div id="state" class="state" hidden></div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "bitrix-crm-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "CRM-дашборд по сделкам для Битрикс24 (VibeCode)",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
