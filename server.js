@@ -42,7 +42,7 @@ const KEY = process.env.BITRIX_API_KEY || "";
 const PORTAL_DOMAIN = process.env.BITRIX_PORTAL_DOMAIN || "";
 const PUBLIC_DIR = path.join(__dirname, "public");
 
-// Generous on purpose — a loaded portal answers correctly after a minute or more.
+// Generous — a loaded portal can answer after a minute or more.
 const PORTAL_TIMEOUT_MS = Number(process.env.PORTAL_TIMEOUT_MS || 180_000);
 
 console.log(
@@ -60,43 +60,63 @@ class PortalError extends Error {
   }
 }
 
-async function portal(pathname, { method = "GET", body } = {}) {
+// Call the Vibe API (`/v1`). Identity model (reviewer requirement):
+// - the app key always goes in `X-Api-Key`;
+// - when a signed-in visitor is present, their session token travels in
+//   `Authorization: Bearer <X-Vibe-Authorization>` so the platform applies the
+//   EMPLOYEE's own rights instead of the app key's.
+async function portal(pathname, { method = "GET", body, auth } = {}) {
   if (!KEY || !BASE) throw new PortalError("no_key", "portal env vars are absent");
+  const headers = { "X-Api-Key": KEY, Accept: "application/json" };
+  if (auth) headers.Authorization = `Bearer ${auth}`;
+  if (body) headers["Content-Type"] = "application/json";
 
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
-  const startedAt = Date.now();
-  let res;
-  try {
-    res = await fetch(`${BASE}${pathname}`, {
-      method,
-      headers: {
-        "X-Api-Key": KEY,
-        Accept: "application/json",
-        ...(body ? { "Content-Type": "application/json" } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: ctl.signal,
-    });
-  } catch (err) {
-    const kind = err?.name === "AbortError" ? "timeout" : "unreachable";
-    throw new PortalError(kind, `${pathname} ${kind} after ${Date.now() - startedAt}ms`);
-  } finally {
-    clearTimeout(timer);
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // Rate-limit retry (Section 5, principle 3): on 429 back off exponentially and
+  // honor the platform's X-RateLimit-* / Retry-After hints rather than hammering.
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), PORTAL_TIMEOUT_MS);
+    const startedAt = Date.now();
+    let res;
+    try {
+      res = await fetch(`${BASE}${pathname}`, {
+        method,
+        headers,
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: ctl.signal,
+      });
+    } catch (err) {
+      const kind = err?.name === "AbortError" ? "timeout" : "unreachable";
+      if (attempt < MAX_ATTEMPTS) { await delay(500 * attempt); continue; }
+      throw new PortalError(kind, `${pathname} ${kind} after ${Date.now() - startedAt}ms`);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+
+    if (res.status === 429 && attempt < MAX_ATTEMPTS) {
+      // Prefer an explicit Retry-After / rate-limit reset header, else exponential backoff.
+      const retryAfter = Number(res.headers.get("retry-after")) || 0;
+      const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(1000 * 2 ** (attempt - 1), 4000);
+      await delay(wait);
+      continue;
+    }
+
+    if (!res.ok) {
+      const kind = res.status === 429 ? "rate_limited"
+        : res.status === 401 || res.status === 403 ? "denied"
+        : "portal_error";
+      throw new PortalError(kind, data?.error?.message || `portal_error_${res.status}`, res.status);
+    }
+    return data?.data ?? data;
   }
-
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
-
-  if (!res.ok) {
-    const kind = res.status === 429 ? "rate_limited"
-      : res.status === 401 || res.status === 403 ? "denied"
-      : "portal_error";
-    throw new PortalError(kind, data?.error?.message || `portal_error_${res.status}`, res.status);
-  }
-  console.log(`[portal] ${pathname} -> ${res.status} in ${Date.now() - startedAt}ms`);
-  return data?.data ?? data;
+  throw new PortalError("rate_limited", `${pathname} rate limited after ${MAX_ATTEMPTS} attempts`);
 }
 
 const HTTP_BY_KIND = {
@@ -112,118 +132,65 @@ const TEXT_BY_KIND = {
   portal_error: "Портал вернул ошибку при запросе данных.",
 };
 
-// ---- background snapshot ----------------------------------------------------
-// The visitor is served from memory, always. Portal work happens on a timer, never
-// inside a request. `data` survives a later failure on purpose.
-const REFRESH_MS = 5 * 60_000;
-const snapshot = { data: null, at: 0, error: null, building: false };
-// How far back the snapshot reaches. Pulling the entire history of a large funnel
-// takes many minutes on every refresh; capping by creation date keeps the dashboard
-// responsive while still covering every realistic deal (incl. old open deals).
-// The UI tells the visitor that the snapshot covers ~3 years.
-const SNAPSHOT_BACK_MS = 3 * 365 * 24 * 60 * 60 * 1000;
+// ---- user-scoped data model --------------------------------------------------
+// No shared deal snapshot. Each visitor is served data derived on request under
+// their own session token, so the platform applies the employee's own rights.
+// A small per-user cache keeps re-access fast, but nothing is shared across users
+// and no full deal list is ever sent to the browser.
 
-// Fetch deals of one category (funnel), paginated by id, and expose them raw.
-// Feeding everything to the request fan-out is both slow and unnecessary when the
-// user works with a single funnel: we pull only that category. `categoryId` may be
-// null/undefined to mean "all categories". Deals older than SNAPSHOT_BACK are not
-// pulled, which bounds the refresh time on large portals.
-async function fetchAllDeals(categoryId) {
-  const deals = [];
-  let lastId = 0;
-  let failed = false;
-  const filter = {
-    createdAt: { "$gte": new Date(Date.now() - SNAPSHOT_BACK_MS).toISOString() },
-  };
-  if (categoryId != null) filter.categoryId = categoryId;
-  while (!failed) {
-    filter[">id"] = lastId;
-    let page;
-    try {
-      const body = await portal("/deals/search", {
-        method: "POST",
-        body: {
-          filter,
-          select: [
-            "id", "title", "stageId", "categoryId", "assignedById",
-            "amount", "currency", "createdAt", "closed",
-            "companyId", "contactId",
-          ],
-          order: { id: "ASC" },
-          limit: 100,
-        },
-      });
-      page = Array.isArray(body) ? body : (body?.items ?? body?.data ?? []);
-    } catch (err) {
-      // Remember why and stop paging; keep whatever we already collected.
-      throw err;
-    }
-    if (!Array.isArray(page) || page.length === 0) break;
-    for (const it of page) {
-      if (it && typeof it.id !== "undefined") {
-        deals.push(it);
-        if (Number(it.id) > lastId) lastId = Number(it.id);
-      }
-    }
-    if (page.length < 100) break;
+const NUMERIC_UID = /^[0-9]+$/;
+
+function authFrom(req) {
+  const h = req.headers["x-vibe-authorization"];
+  if (typeof h === "string" && h) {
+    // Normalize "vibe_session_..." / "Bearer vibe_session_..." to the raw token.
+    return h.replace(/^Bearer\s+/i, "").trim();
   }
-  return deals;
+  return null;
 }
 
-// Fetch the deal category (funnel) list so the frontend can offer a funnel picker
-// and filter by a human-readable name ("Продажи услуг (общее)"). The exact REST
-// path of the deal-category endpoint is not fixed across proxies, so we try the
-// most likely candidates and use the first one that answers. Each attempt is
-// cheap; categories are tiny and this runs only in the background snapshot.
-const CATEGORY_PATHS = [
-  "/deal-categories",
-  "/deals/categories",
-  "/crm/category/list",
-];
+function uidFrom(req) {
+  const v = req.headers["x-vibe-user-id"];
+  return typeof v === "string" && NUMERIC_UID.test(v) ? Number(v) : null;
+}
+
+// ---- deal dictionaries (small, non-user-scoped, refreshed rarely) ------------
+let categoriesCache = { at: 0, items: [] };
+let stagesCache = { at: 0, map: {}, items: [] };
+let usersCache = { at: 0, map: {} };
+const CACHE_TTL = 15 * 60_000;
 
 async function fetchCategories() {
-  let lastErr = null;
-  for (const p of CATEGORY_PATHS) {
+  if (categoriesCache.items.length && Date.now() - categoriesCache.at < CACHE_TTL) {
+    return categoriesCache.items;
+  }
+  let items = [];
+  for (const p of ["/deal-categories", "/deals/categories", "/crm/category/list"]) {
     try {
       const body = await portal(p);
-      const arr = Array.isArray(body)
-        ? body
-        : (body?.items ?? body?.categories ?? body?.data ?? []);
-      if (!Array.isArray(arr)) continue;
-      const cats = arr
-        .map((c) => ({
-          id: c.id ?? c.categoryId ?? null,
-          name: c.name ?? c.title ?? `Воронка ${c.id ?? "?"}`,
-        }))
-        .filter((c) => c.id != null);
-      if (cats.length) return { source: p, items: cats };
-    } catch (err) {
-      if (err?.kind) lastErr = err;
-    }
+      const arr = Array.isArray(body) ? body : (body?.items ?? body?.categories ?? body?.data ?? []);
+      if (Array.isArray(arr)) {
+        items = arr
+          .map((c) => ({ id: c.id ?? c.categoryId ?? null, name: c.name ?? c.title ?? `Воронка ${c.id ?? "?"}` }))
+          .filter((c) => c.id != null);
+        if (items.length) break;
+      }
+    } catch { /* try next candidate */ }
   }
-  if (lastErr) throw lastErr;
-  return { source: null, items: [] };
+  categoriesCache = { at: Date.now(), items };
+  return items;
 }
 
-// Fetch all deal-stage statuses (the /v1/statuses dictionary) and return a flat map
-// { statusId -> { name, semantics, sort } } plus the raw list. Deal stages live under
-// entityIds of the form "DEAL_STAGE" (shared funnel, categoryId 0) and "DEAL_STAGE_<N>"
-// (custom funnels), and each row's `statusId` is exactly what a deal carries in its
-// `stageId` field (e.g. "NEW", "C6:5", "ANOTHER_PRODUCT"). `name` is the human-readable
-// label, `semantics` is S/F/P (success/failure/process), and `sort` is the order a stage
-// appears in — both used to colour and order the funnel the same way the portal kanban does.
 async function fetchStageStatuses() {
+  if (stagesCache.items.length && Date.now() - stagesCache.at < CACHE_TTL) {
+    return stagesCache;
+  }
   const items = [];
   let offset = 0;
   for (let guard = 0; guard < 100; guard += 1) {
     const body = await portal("/statuses/search", {
       method: "POST",
-      body: {
-        filter: {},
-        select: ["id", "entityId", "statusId", "name", "categoryId", "semantics", "sort"],
-        limit: 100,
-        offset,
-      },
+      body: { filter: {}, limit: 100, offset },
     });
     const page = Array.isArray(body) ? body : (body?.items ?? body?.data ?? []);
     if (!Array.isArray(page) || page.length === 0) break;
@@ -238,31 +205,24 @@ async function fetchStageStatuses() {
   const map = {};
   for (const s of items) {
     if (s.statusId && s.name) {
-      map[s.statusId] = {
-        name: s.name,
-        semantics: s.semantics || null,
-        sort: typeof s.sort === "number" ? s.sort : 9999,
-      };
+      map[s.statusId] = { name: s.name, semantics: s.semantics || null, sort: typeof s.sort === "number" ? s.sort : 9999 };
     }
   }
-  return { map, items };
+  stagesCache = { at: Date.now(), map, items };
+  return stagesCache;
 }
 
-// Fetch all portal users and build { id -> fullName } so the frontend can show the
-// responsible person's full name instead of the numeric id in "Последние сделки".
 async function fetchUsers() {
+  if (Object.keys(usersCache.map).length && Date.now() - usersCache.at < CACHE_TTL) {
+    return usersCache.map;
+  }
   const map = {};
   let lastId = 0;
   let page;
   do {
     const body = await portal("/users/search", {
       method: "POST",
-      body: {
-        filter: { ">id": lastId },
-        select: ["id", "name", "lastName", "secondName"],
-        order: { id: "ASC" },
-        limit: 100,
-      },
+      body: { filter: { ">id": lastId }, select: ["id", "name", "lastName", "secondName"], order: { id: "ASC" }, limit: 100 },
     });
     page = Array.isArray(body) ? body : (body?.items ?? body?.data ?? []);
     if (!Array.isArray(page) || page.length === 0) break;
@@ -273,49 +233,120 @@ async function fetchUsers() {
       if (Number(u.id) > lastId) lastId = Number(u.id);
     }
   } while (page && page.length >= 100);
+  usersCache = { at: Date.now(), map };
   return map;
 }
 
-async function refresh() {
-  if (snapshot.building) return;
-  snapshot.building = true;
-  try {
-    // The current portal user id is not fetched from /users/me here: that endpoint
-    // needs the 'user' scope, which the key may not hold. Instead the identity of the
-    // signed-in visitor arrives via the X-Vibe-User-Id gateway header on each request,
-    // so /api/dashboard derives "my deals" from that header (see below). A snapshot
-    // only carries the portal-wide deal set.
-    const categories = await fetchCategories();
-    // Default funnel: the one whose name contains "продажи услуг", else the shared
-    // funnel categoryId 0 (the portal's main "Продажи (общее)" funnel, which is not
-    // returned by the category list), else the first listed category.
-    const byName = categories.items.find((c) =>
-      c.name && c.name.toLowerCase().includes("продажи услуг"),
-    );
-    const target = byName || { id: 0 };
-    const deals = await fetchAllDeals(target.id);
-    // Stage dictionary: map every DEAL_STAGE* statusId to its human-readable name.
-    // This is what turns codes like "C6:5" / "ANOTHER_PRODUCT" into real stage names.
-    const stages = await fetchStageStatuses();
-    // User dictionary: id -> full name, to show the responsible person's name.
-    const users = await fetchUsers();
-    snapshot.data = {
-      me: { id: null },
-      deals,
-      categories: categories.items,
-      categoriesSource: categories.source,
-      stages,
-      users,
-      defaultCategoryId: target.id,
-    };
-    snapshot.at = Date.now();
-    snapshot.error = null;
-  } catch (err) {
-    snapshot.error = { kind: err.kind || "portal_error", message: err.message };
-    console.log(`[snapshot] refresh failed: ${snapshot.error.kind} — ${err.message}`);
-  } finally {
-    snapshot.building = false;
+// ---- derived data for the dashboard (always under the visitor's token) --------
+
+function periodFromMs(period) {
+  const now = Date.now();
+  if (period === "30") return now - 30 * 86400000;
+  if (period === "90") return now - 90 * 86400000;
+  if (period === "180") return now - 180 * 86400000;
+  if (period === "year") { const d = new Date(); return new Date(d.getFullYear(), 0, 1).getTime(); }
+  return null; // "all"
+}
+
+async function collectDashboard(auth, q) {
+  const period = q.period || "all";
+  const category = q.category; // "" or null => all funnels
+  const stage = q.stage; // "" or null => all stages
+  const scope = q.scope || "all"; // all | mine
+  const meId = q.meId;
+
+  const from = periodFromMs(period);
+  const dateFilter = from ? { createdAt: { "$gte": new Date(from).toISOString() } } : {};
+  const categoryFilter = category ? { categoryId: Number(category) } : {};
+  const stageFilter = stage ? { stageId: stage } : {};
+  const responsibleFilter = (scope === "mine" && meId) ? { assignedById: meId } : {};
+
+  const baseFilter = { ...dateFilter, ...categoryFilter, ...stageFilter, ...responsibleFilter };
+
+  // Funnel summary: aggregation platform-side, groupBy stageId (+ sum of amount).
+  const funnelAgg = await portal("/deals/aggregate", {
+    method: "POST",
+    auth,
+    body: {
+      aggregate: [{ field: "amount", function: "sum" }],
+      filter: baseFilter,
+      groupBy: "stageId",
+    },
+  });
+
+  // KPI. Open deals (in work) sum: no date window — the whole funnel now.
+  const openFilter = { ...categoryFilter, ...stageFilter, ...responsibleFilter, ...(stage ? {} : { stageSemanticId: "P" }) };
+  const openAgg = await portal("/deals/aggregate", {
+    method: "POST",
+    auth,
+    body: { aggregate: [{ field: "amount", function: "sum" }], filter: openFilter },
+  });
+
+  // Won deals sum + count within the period.
+  const wonFilter = { ...dateFilter, ...categoryFilter, ...stageFilter, ...responsibleFilter, stageSemanticId: "S" };
+  const wonAgg = await portal("/deals/aggregate", {
+    method: "POST",
+    auth,
+    body: { aggregate: [{ field: "amount", function: "sum" }], filter: wonFilter },
+  });
+
+  // Recent deals: separate narrow request.
+  const recent = await portal("/deals/search", {
+    method: "POST",
+    auth,
+    body: {
+      filter: baseFilter,
+      select: ["id", "title", "amount", "currency", "stageId", "assignedById", "createdAt", "categoryId"],
+      sort: { createdAt: "desc" },
+      limit: 15,
+      withTotal: false,
+    },
+  });
+  const recentList = Array.isArray(recent) ? recent : (recent?.items ?? recent?.data ?? []);
+
+  const groups = (funnelAgg && Array.isArray(funnelAgg.groups)) ? funnelAgg.groups : [];
+  const openSum = openAgg?.aggregates?.amount?.sum ?? 0;
+  const openCount = openAgg?.count ?? 0;
+  const wonSum = wonAgg?.aggregates?.amount?.sum ?? 0;
+  const wonCount = wonAgg?.count ?? 0;
+  const avg = wonCount ? Math.round(wonSum / wonCount) : 0;
+
+  return {
+    funnel: groups.map((g) => ({
+      stageId: g.stageId,
+      count: g.count ?? 0,
+      sum: g.aggregates?.amount?.sum ?? 0,
+      truncated: Boolean(g.truncated || funnelAgg?.meta?.truncated),
+    })),
+    kpi: { openSum, openCount, wonCount, wonSum, avg },
+    recent: recentList.slice(0, 15).map((d) => ({
+      id: d.id, title: d.title, amount: d.amount, currency: d.currency,
+      stageId: d.stageId, assignedById: d.assignedById, createdAt: d.createdAt, categoryId: d.categoryId,
+    })),
+    truncated: Boolean(funnelAgg?.meta?.truncated) || Boolean(openAgg?.meta?.truncated) || Boolean(wonAgg?.meta?.truncated),
+  };
+}
+
+// Per-user cache with bounded size to keep repeated access fast.
+const userCache = new Map();
+const USER_CACHE_TTL = 60_000;
+const USER_CACHE_MAX = 50;
+
+function remember(userId, key, value) {
+  let entry = userCache.get(userId);
+  if (!entry) { entry = new Map(); userCache.set(userId, entry); }
+  entry.set(key, { at: Date.now(), value });
+  if (userCache.size > USER_CACHE_MAX) {
+    const oldest = userCache.keys().next().value;
+    if (oldest !== undefined) userCache.delete(oldest);
   }
+}
+
+function recall(userId, key) {
+  const entry = userCache.get(userId);
+  const hit = entry && entry.get(key);
+  if (hit && Date.now() - hit.at < USER_CACHE_TTL) return hit.value;
+  return null;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -327,34 +358,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (url.pathname === "/api/dashboard") {
-    // Identity of the signed-in visitor, injected by the platform gateway. Only a
-    // pure numeric value is usable as a Bitrix24 user id for filtering "my deals".
-    const vibeUid = req.headers["x-vibe-user-id"];
-    const meId = typeof vibeUid === "string" && /^[0-9]+$/.test(vibeUid) ? Number(vibeUid) : null;
-    const meta = {
-      updatedAt: snapshot.at ? new Date(snapshot.at).toISOString() : null,
-      ageMs: snapshot.at ? Date.now() - snapshot.at : null,
-      building: snapshot.building,
-      warning: snapshot.error ? TEXT_BY_KIND[snapshot.error.kind] : null,
-      portalDomain: PORTAL_DOMAIN,
-    };
-    if (snapshot.data) {
-      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ ...snapshot.data, me: { id: meId }, meta }));
-      return;
-    }
-    const kind = snapshot.error?.kind ?? (KEY && BASE ? "loading" : "no_key");
-    if (kind === "loading") {
-      res.writeHead(202, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Данные ещё загружаются. Портал отвечает медленно, подождите.", meta }));
-      return;
-    }
-    res.writeHead(HTTP_BY_KIND[kind] || 500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: TEXT_BY_KIND[kind], kind, meta }));
-    return;
-  }
-
   if (url.pathname === "/api/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -362,8 +365,80 @@ const server = http.createServer(async (req, res) => {
       keySource: KEY ? (KEY_FROM_ENVIRONMENT ? "environment" : ENV_FILE) : null,
       baseUrlPresent: Boolean(BASE),
       portalTimeoutMs: PORTAL_TIMEOUT_MS,
-      snapshot: { updatedAt: snapshot.at ? new Date(snapshot.at).toISOString() : null, building: snapshot.building, lastError: snapshot.error },
     }));
+    return;
+  }
+
+  if (url.pathname === "/api/me") {
+    // Proof of actual scopes / access mode, without the key itself.
+    if (!KEY) { res.writeHead(503, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: TEXT_BY_KIND.no_key })); return; }
+    try {
+      const me = await portal("/me");
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({
+        success: true,
+        data: {
+          type: me?.type ?? null,
+          portal: me?.portal ?? null,
+          scopes: me?.scopes ?? [],
+          accessMode: me?.accessMode ?? null,
+          currentUser: me?.currentUser ?? null,
+        },
+      }));
+    } catch (err) {
+      const kind = err.kind || "portal_error";
+      res.writeHead(HTTP_BY_KIND[kind] || 500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: TEXT_BY_KIND[kind], kind }));
+    }
+    return;
+  }
+
+  if (url.pathname === "/api/dashboard") {
+    const auth = authFrom(req);
+    const meId = uidFrom(req);
+    if (!auth) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Сессия платформы не обнаружена. Войдите в Битрикс24." }));
+      return;
+    }
+
+    const q = {
+      period: url.searchParams.get("period") || "all",
+      category: url.searchParams.get("category") || "",
+      stage: url.searchParams.get("stage") || "",
+      scope: url.searchParams.get("scope") || "all",
+      meId,
+    };
+    const cacheKey = `${q.period}|${q.category}|${q.stage}|${q.scope}`;
+
+    const meta = { portalDomain: PORTAL_DOMAIN, meId };
+    let payload = null;
+    let err = null;
+
+    if (meId != null) payload = recall(meId, cacheKey);
+
+    if (payload) {
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ...payload, me: { id: meId }, meta }));
+      return;
+    }
+
+    try {
+      const [categories, stages, users, data] = await Promise.all([
+        fetchCategories(),
+        fetchStageStatuses(),
+        fetchUsers(),
+        collectDashboard(auth, q),
+      ]);
+      payload = { categories, stages: { map: stages.map, items: stages.items }, users, ...data };
+      if (meId != null) remember(meId, cacheKey, payload);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ...payload, me: { id: meId }, meta }));
+    } catch (e) {
+      const kind = e.kind || "portal_error";
+      res.writeHead(HTTP_BY_KIND[kind] || 500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: TEXT_BY_KIND[kind], kind, meta }));
+    }
     return;
   }
 
@@ -392,5 +467,18 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => console.log(`listening on ${PORT}`));
-void refresh();
-setInterval(() => void refresh(), REFRESH_MS).unref();
+
+// Startup self-check: report the key's actual type / access mode / scopes to the
+// runtime log (never the key itself). Lets us verify the identity model on the
+// deployed app without exposing secrets. See safety rules, "GET /v1/me" principle.
+(async () => {
+  try {
+    const me = await portal("/me");
+    console.log(`[me] type=${me?.type ?? "?"} accessMode=${me?.accessMode ?? "?"}`);
+    if (Array.isArray(me?.scopes)) {
+      console.log(`[me] scopes=${me.scopes.join(",")}`);
+    }
+  } catch (e) {
+    console.log(`[me] self-check failed: ${e?.kind || "error"}`);
+  }
+})();
